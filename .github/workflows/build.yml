@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential gcc make
+    
+    - name: Build library objects
+      run: |
+        make clean
+        mkdir -p build
+        # Compile library source files
+        for src in MiCo-Lib/src/*.c; do
+          mkdir -p build/$(dirname $src)
+          gcc -O3 -DUSE_HOST -c -o build/${src%.c}.o $src -I./MiCo-Lib/include -I./MiCo-Lib/test -I./
+        done
+        for src in MiCo-Lib/src/mico/*.c; do
+          mkdir -p build/$(dirname $src)
+          gcc -O3 -DUSE_HOST -c -o build/${src%.c}.o $src -I./MiCo-Lib/include -I./MiCo-Lib/test -I./
+        done
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          build/
+          *.elf
+          *.asm
+        retention-days: 7

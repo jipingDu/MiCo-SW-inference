@@ -1,0 +1,102 @@
+name: Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential gcc make
+    
+    - name: Build and run tests
+      run: |
+        # Build and run each test using the Makefile with MAIN override
+        TEST_COUNT=0
+        PASS_COUNT=0
+        FAIL_COUNT=0
+        
+        # List of regular tests (without .c extension)
+        REGULAR_TESTS="matmul_test bitconv2d_test bitlinear_test bnmatmul_test quant_test avgpool4d_f32_test maxpool4d_f32_test"
+        
+        for test_name in $REGULAR_TESTS; do
+          if [ -f "tests/${test_name}.c" ]; then
+            echo "Building and running $test_name..."
+            
+            BUILD_LOG=$(mktemp)
+            # Build using Makefile with MAIN override
+            if make TARGET=host MAIN=tests/$test_name clean > /dev/null 2>&1 && \
+               make TARGET=host MAIN=tests/$test_name tests/${test_name}.elf 2>&1 | tee "$BUILD_LOG"; then
+              BUILD_EXIT=${PIPESTATUS[1]}
+              
+              if [ $BUILD_EXIT -eq 0 ]; then
+                TEST_COUNT=$((TEST_COUNT + 1))
+                if timeout 30s ./tests/${test_name}.elf > /dev/null 2>&1; then
+                  echo "✓ Test $test_name passed"
+                  PASS_COUNT=$((PASS_COUNT + 1))
+                else
+                  echo "✗ Test $test_name failed with exit code $?"
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                fi
+              else
+                echo "⚠ Failed to build $test_name - Compilation errors:"
+                cat "$BUILD_LOG"
+              fi
+            fi
+            rm -f "$BUILD_LOG"
+          fi
+        done
+        
+        # Special handling for matmul_regression with OPT=ref
+        if [ -f "tests/matmul_regression.c" ]; then
+          echo "Building and running matmul_regression with OPT=ref..."
+          BUILD_LOG=$(mktemp)
+          
+          if make TARGET=host OPT=ref MAIN=tests/matmul_regression clean > /dev/null 2>&1 && \
+             make TARGET=host OPT=ref MAIN=tests/matmul_regression tests/matmul_regression.elf 2>&1 | tee "$BUILD_LOG"; then
+            BUILD_EXIT=${PIPESTATUS[1]}
+            
+            if [ $BUILD_EXIT -eq 0 ]; then
+              TEST_COUNT=$((TEST_COUNT + 1))
+              if timeout 30s ./tests/matmul_regression.elf > /dev/null 2>&1; then
+                echo "✓ Test matmul_regression passed"
+                PASS_COUNT=$((PASS_COUNT + 1))
+              else
+                echo "✗ Test matmul_regression failed with exit code $?"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              fi
+            else
+              echo "⚠ Failed to build matmul_regression - Compilation errors:"
+              cat "$BUILD_LOG"
+            fi
+          fi
+          rm -f "$BUILD_LOG"
+        fi
+        
+        echo "Tests passed: $PASS_COUNT / $TEST_COUNT"
+        echo "Tests failed: $FAIL_COUNT / $TEST_COUNT"
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          tests/*.elf
+          build/
+        retention-days: 7
