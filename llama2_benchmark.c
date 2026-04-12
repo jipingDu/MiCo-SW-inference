@@ -636,8 +636,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         #ifdef USE_INT8_KV
         // Quantize and store k and v into the kv cache
         long quant_start = MiCo_time();
-        s->key_scales[l * p->seq_len + pos] = __FP32toQ8(qk_ptr, s->k, kv_dim);
-        s->value_scales[l * p->seq_len + pos] = __FP32toQ8(qv_ptr, s->v, kv_dim);
+        s->key_scales[l * p->seq_len + pos] = __FP32toQ8_kv_packed(qk_ptr, s->k, kv_dim);
+        s->value_scales[l * p->seq_len + pos] = __FP32toQ8_kv_packed(qv_ptr, s->v, kv_dim);
         QUANT_TIMER += MiCo_time() - quant_start;
         #endif
 
