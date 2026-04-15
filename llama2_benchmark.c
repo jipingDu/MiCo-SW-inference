@@ -15,6 +15,8 @@
 
 #include "nn.h"
 #include "profile.h"
+extern float MiCo_absmax(float* x, size_t n);
+extern void __FP32toQ8_hw(void* qx, float* x, size_t n, float scale);
 #include "mico_nn.h"
 #include "mico_quant.h"
 
@@ -636,8 +638,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         #ifdef USE_INT8_KV
         // Quantize and store k and v into the kv cache
         long quant_start = MiCo_time();
-        s->key_scales[l * p->seq_len + pos] = __FP32toQ8_kv_packed(qk_ptr, s->k, kv_dim);
-        s->value_scales[l * p->seq_len + pos] = __FP32toQ8_kv_packed(qv_ptr, s->v, kv_dim);
+        s->key_scales[l * p->seq_len + pos] = __FP32toQ8(qk_ptr, s->k, kv_dim);
+        s->value_scales[l * p->seq_len + pos] = __FP32toQ8(qv_ptr, s->v, kv_dim);
         QUANT_TIMER += MiCo_time() - quant_start;
         #endif
 
@@ -1210,6 +1212,51 @@ const int total_step = 1;
 
 int main(){
     printf("MiCo Transformer Demo\n");
+#ifdef VERIFY_QUANT_HW
+    {
+        extern uint32_t quant_hw_selftest(void);
+        uint32_t result = quant_hw_selftest();
+        printf("QUANT HW SELFTEST result=0x%08X expected=0x04030201\n", result);
+        if(result == 0x04030201)
+            printf("QUANT HW SELFTEST PASS\n");
+        else
+            printf("QUANT HW SELFTEST FAIL\n");
+    }
+    // quant_pack4_i8 测试放在最后，避免破坏浮点寄存器
+    {
+        extern uint32_t quant_pack4_i8(int32_t v0, int32_t v1, int32_t v2, int32_t v3);
+        uint32_t r2 = quant_pack4_i8(1, 2, 3, 4);
+        printf("quant_pack4_i8(1,2,3,4)=0x%08X expected=0x04030201\n", r2);
+    }
+#endif
+#ifdef VERIFY_QUANT_HW
+    {
+        // 测试用例
+        float test_x[8] = {0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 127.0f, -128.0f, 0.001f};
+        int8_t qx1[8], qx2[8];
+        float s1 = __FP32toQ8((qbyte*)qx1, test_x, 8);
+        {
+            float _amax = MiCo_absmax(test_x, 8);
+            float _scale = (_amax == 0.0f) ? 1.0f : (float)(127.0 / _amax);
+            printf("VERIFY: amax=%f scale=%f\n", _amax, _scale);
+            __FP32toQ8_hw((qbyte*)qx2, test_x, 8, _scale);
+            printf("VERIFY: qx2=%d %d %d %d\n", qx2[0],qx2[1],qx2[2],qx2[3]);
+        }
+        float s2 = s1;  // scale 由调用方算，这里直接用 ref scale 对比 qx
+        int mismatch = 0;
+        for(int i = 0; i < 8; i++){
+            if(qx1[i] != qx2[i]){
+                printf("QUANT MISMATCH i=%d ref=%d hw=%d\n", i, qx1[i], qx2[i]);
+                mismatch = 1;
+            }
+        }
+        float sdiff = s1 - s2; if(sdiff<0) sdiff=-sdiff;
+        if(sdiff > 1e-6f)
+            printf("QUANT SCALE MISMATCH ref=%f hw=%f\n", s1, s2);
+        if(!mismatch)
+            printf("QUANT HW VERIFY PASS\n");
+    }
+#endif
 
     float temperature = 0.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 1.0f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower

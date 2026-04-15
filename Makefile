@@ -8,6 +8,7 @@ MICO_DIR = MiCo-Lib
 MICO_INCLUDES = $(MICO_DIR)/include $(MICO_DIR)/test
 MICO_SOURCES = $(wildcard $(MICO_DIR)/src/*.c)
 MICO_SOURCES += $(wildcard $(MICO_DIR)/src/mico/*.c)
+MICO_SOURCES += $(wildcard $(MICO_DIR)/src/mico/*.S)
 
 OPT ?=
 TARGET ?= host
