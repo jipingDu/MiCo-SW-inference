@@ -180,11 +180,11 @@ void malloc_run_state(RunState* s, Config* p) {
     s->logits = calloc(p->vocab_size, sizeof(float));
 
     // RoPE precompute: inv_freq per head (shared across heads)
-    s->rope_inv_freq = calloc(1, sizeof(float));
+    s->rope_inv_freq = calloc(head_pairs, sizeof(float));
     // Precompute cos/sin for all positions and per-head pairs
     // size_t tbl_elems = (size_t)p->seq_len * head_pairs;
-    s->rope_cos = calloc(1, sizeof(float));
-    s->rope_sin = calloc(1, sizeof(float));
+    s->rope_cos = calloc((size_t)p->seq_len * head_pairs, sizeof(float));
+    s->rope_sin = calloc((size_t)p->seq_len * head_pairs, sizeof(float));
 
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
@@ -197,19 +197,17 @@ void malloc_run_state(RunState* s, Config* p) {
     // printf("Precomputing RoPE tables (%ld Bytes)...\n", 
     //     tbl_elems * sizeof(float) * 2);
     // long start = MiCo_time();
-    // // Fill inv_freq: 10000^(-2k/d_head), k in [0, head_size/2)
-    // for (int k = 0; k < head_pairs; ++k) {
-    //     s->rope_inv_freq[k] = powf(10000.0f, -2.0f * (float)k / (float)head_size);
-    // }
-    // // Fill tables
-    // for (int pos = 0; pos < p->seq_len; ++pos) {
-    //     for (int k = 0; k < head_pairs; ++k) {
-    //         float angle = pos * s->rope_inv_freq[k];
-    //         size_t idx = (size_t)pos * head_pairs + k;
-    //         s->rope_cos[idx] = cosf(angle);
-    //         s->rope_sin[idx] = sinf(angle);
-    //     }
-    // }
+    // Fill inv_freq
+    for (int k = 0; k < head_pairs; ++k)
+        s->rope_inv_freq[k] = powf(10000.0f, -2.0f * (float)k / (float)head_size);
+    // Fill tables
+    for (int pos = 0; pos < p->seq_len; ++pos)
+        for (int k = 0; k < head_pairs; ++k) {
+            float angle = pos * s->rope_inv_freq[k];
+            size_t idx = (size_t)pos * head_pairs + k;
+            s->rope_cos[idx] = cosf(angle);
+            s->rope_sin[idx] = sinf(angle);
+        }
     long end = MiCo_time();
     long total_run_state_size = p->dim * sizeof(float) * 4;
     total_run_state_size += p->hidden_dim * sizeof(float) * 2;
@@ -403,7 +401,7 @@ void memory_map_weights(
         w->wcls.data = (WeightType*) ptr;
         w->wcls.wq = 8;
         ptr += p->vocab_size * p->dim * sizeof(WeightType);
-        w->token_embedding_table = malloc(p->vocab_size * sizeof(float));
+        w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
         // printf("Allocating Embedding Table of size %ld KB...\n",
             // (p->vocab_size * p->dim * sizeof(float)) / 1024);
         #else
@@ -424,10 +422,9 @@ void memory_map_weights(
     if(shared_weights){
         w->wcls.scale = *(float*)ptr;
         ptr += sizeof(float);
-        // for(int i = 0; i < p->vocab_size * p->dim; i++){
-        //     int8_t v = ((int8_t*)w->wcls.data)[i];
-        //     w->token_embedding_table[i] = v * w->wcls.scale;
-        // }
+        // Fill embedding table after scale is loaded
+        for(int i = 0; i < p->vocab_size * p->dim; i++)
+            w->token_embedding_table[i] = (float)((int8_t*)w->wcls.data)[i] * w->wcls.scale;
     }
     #endif
 
@@ -601,8 +598,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     };
 
     // copy the token embedding into x
-    // float* content_row = w->token_embedding_table + token * dim;
-    // memcpy(x, content_row, dim*sizeof(*x));
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim*sizeof(*x));
     long forward_start = MiCo_time();
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
@@ -649,8 +646,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
             int kpair = (i % head_size) >> 1; // pair index within the head
             size_t ridx = (size_t)pos * head_pairs + kpair;
-            float fcr = s->rope_cos[0];
-            float fci = s->rope_sin[0];
+            float fcr = s->rope_cos[ridx];
+            float fci = s->rope_sin[ridx];
 
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
             for (int v = 0; v < rotn; v++) {
@@ -1151,6 +1148,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int num_prompt_tokens = 0;
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+
     if (num_prompt_tokens < 1) {
         printf("something is wrong, expected at least 1 prompt token\n");
         exit(EXIT_FAILURE);
@@ -1260,9 +1258,9 @@ int main(){
 
     float temperature = 0.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 1.0f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int start_pos = CONTEXT_LEN;          // position in the sequence to start at, normally 0
-    int steps = start_pos + total_step;     // number of steps to run for
-    char *prompt = ""; // prompt string
+    int start_pos = CONTEXT_LEN;
+    int steps = start_pos + total_step;
+    char *prompt = "";
     unsigned long long rng_seed = 42; // seed rng with time by default
 
     // parameter validation/overrides
