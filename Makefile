@@ -14,6 +14,7 @@ OPT ?=
 TARGET ?= host
 
 CFLAGS ?=
+EXTRA_CFLAGS ?=
 
 CFLAGS += -O3
 # CFLAGS += -Wall
@@ -48,10 +49,17 @@ OBJS := $(OBJS:.s=.o)
 OBJS := $(addprefix $(BUILD)/,$(OBJS))
 
 LLAMA2_BIN ?=
+INT8_KV ?= 1
 
 ifneq ("$(LLAMA2_BIN)","")
 CFLAGS += -DLLAMA2_BIN=\"$(LLAMA2_BIN)\"
 endif
+
+ifeq ($(INT8_KV),1)
+CFLAGS += -DUSE_INT8_KV
+endif
+
+CFLAGS += $(EXTRA_CFLAGS)
 
 $(BUILD)/%.o: %.c | $(BUILD)
 	@mkdir -p $(dir $@)

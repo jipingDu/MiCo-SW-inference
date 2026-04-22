@@ -230,8 +230,8 @@ size_t init_weight(DataType* w, char* ptr, int n_layers, int n, int m){
 size_t init_quant_weight(DataType* w, char* ptr, int n_layers, int n, int m){
     char* ptr0 = ptr;
     for (int i = 0; i < n_layers; i++) {
-        w[i].shape[0] = n;
-        w[i].shape[1] = m;
+        w[i].shape[0] = m;  // out_features
+        w[i].shape[1] = n;  // in_features
         // w[i].scale = *(float*)ptr;
         // ptr += sizeof(float);
         w[i].data = (WeightType*) ptr;
@@ -352,7 +352,7 @@ void memory_map_weights(
     w->w1 = (DataType*)malloc(n_layers * sizeof(DataType));
     #ifdef QUANTIZED
     init_weight_qtypes(q->w1_qtype, w->w1, n_layers);
-    ptr += init_quant_weight(w->w1, ptr, n_layers, p->hidden_dim, p->dim);
+    ptr += init_quant_weight(w->w1, ptr, n_layers, p->dim, p->hidden_dim);
     #else
     ptr += init_weight(w->w1, ptr, n_layers, p->hidden_dim, p->dim);
     #endif
@@ -360,7 +360,7 @@ void memory_map_weights(
     w->w2 = (DataType*)malloc(n_layers * sizeof(DataType));
     #ifdef QUANTIZED
     init_weight_qtypes(q->w2_qtype, w->w2, n_layers);
-    ptr += init_quant_weight(w->w2, ptr, n_layers, p->dim, p->hidden_dim);
+    ptr += init_quant_weight(w->w2, ptr, n_layers, p->hidden_dim, p->dim);
     #else
     ptr += init_weight(w->w2, ptr, n_layers, p->dim, p->hidden_dim);
     #endif
@@ -368,7 +368,7 @@ void memory_map_weights(
     w->w3 = (DataType*)malloc(n_layers * sizeof(DataType));
     #ifdef QUANTIZED
     init_weight_qtypes(q->w3_qtype, w->w3, n_layers);
-    ptr += init_quant_weight(w->w3, ptr, n_layers, p->hidden_dim, p->dim);
+    ptr += init_quant_weight(w->w3, ptr, n_layers, p->dim, p->hidden_dim);
     #else
     ptr += init_weight(w->w3, ptr, n_layers, p->hidden_dim, p->dim);
     #endif
@@ -488,6 +488,8 @@ long RMSNORM_TIMER = 0;
 long FMATMUL_TIMER = 0;
 long ATTENTION_TIMER = 0;
 long ROPE_TIMER = 0;
+long ATTN_QK_DOT_TIMER = 0;
+long ATTN_AV_ACC_TIMER = 0;
 
 void init_timers() {
     SOFTMAX_TIMER = 0;
@@ -498,6 +500,8 @@ void init_timers() {
     SOFTMAX_TIMER = 0;
     ATTENTION_TIMER = 0;
     ROPE_TIMER = 0;
+    ATTN_QK_DOT_TIMER = 0;
+    ATTN_AV_ACC_TIMER = 0;
 }
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
@@ -601,14 +605,6 @@ float* forward(Transformer* transformer, int token, int pos) {
         fmatmul(s->v, s->xb, w->wv + l, dim, kv_dim);
         #endif
         
-        #ifdef USE_INT8_KV
-        // Quantize and store k and v into the kv cache
-        long quant_start = MiCo_time();
-        s->key_scales[l*p->seq_len + pos] = __FP32toQ8(qk_ptr, s->k, kv_dim);
-        s->value_scales[l*p->seq_len + pos] = __FP32toQ8(qv_ptr, s->v, kv_dim);
-        QUANT_TIMER += MiCo_time() - quant_start;
-        #endif
-
         long rope_start = MiCo_time();
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -628,6 +624,15 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
         ROPE_TIMER += MiCo_time() - rope_start;
+
+        #ifdef USE_INT8_KV
+        // Cache the RoPE-applied key; value is unchanged by RoPE.
+        long quant_start = MiCo_time();
+        s->key_scales[l*p->seq_len + pos] = __FP32toQ8(qk_ptr, s->k, kv_dim);
+        s->value_scales[l*p->seq_len + pos] = __FP32toQ8(qv_ptr, s->v, kv_dim);
+        QUANT_TIMER += MiCo_time() - quant_start;
+        #endif
+
         // multihead attention. iterate over all heads
         long attn_start = MiCo_time();
 
@@ -722,6 +727,13 @@ float* forward(Transformer* transformer, int token, int pos) {
     #endif
 
     #ifdef QUANTIZED
+#ifdef DEBUG_LOGITS
+    {
+        float xmax=x[0], xmin=x[0];
+        for(int i=1;i<p->dim;i++){if(x[i]>xmax)xmax=x[i];if(x[i]<xmin)xmin=x[i];}
+        printf("pre-cls: x[0]=%f xmax=%f xmin=%f wcls.scale=%f\n", x[0], xmax, xmin, w->wcls.scale);
+    }
+#endif
     qmatmul(s->logits, x, &w->wcls, p->dim, p->vocab_size, w->wcls.wq, 8); // final classifier always uses 8-bit quant
     #else
     Tensor2D_F32 wcls = { .shape = {p->vocab_size, dim}, .data = w->wcls };
@@ -1130,6 +1142,16 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits
+#ifdef DEBUG_LOGITS
+            if(pos < num_prompt_tokens + 3) {
+                float maxv=-1e38; int maxi=0;
+                int vocab = transformer->config.vocab_size;
+                for(int i=0;i<vocab;i++) if(logits[i]>maxv){maxv=logits[i];maxi=i;}
+                printf("pos=%d top1: token=%d logit=%f\n", pos, maxi, maxv);
+                float sum=0; for(int i=0;i<vocab;i++) sum+=logits[i];
+                printf("pos=%d logit_sum=%f logit[0]=%f\n", pos, sum, logits[0]);
+            }
+#endif
             next = sample(sampler, logits);
         }
         pos++;
@@ -1172,9 +1194,9 @@ int main(){
     printf("MiCo Transformer Demo\n");
     float temperature = 0.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 1.0f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int start_pos = 32;          // position in the sequence to start at, normally 0
-    int steps = start_pos + total_step;     // number of steps to run for
-    char *prompt = ""; // prompt string
+    int start_pos = 0;
+    int steps = 128;
+    char *prompt = "Once upon a time";
     unsigned long long rng_seed = 42; // seed rng with time by default
 
     // parameter validation/overrides
